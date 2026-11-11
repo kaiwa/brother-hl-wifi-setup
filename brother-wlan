@@ -1,0 +1,175 @@
+#!/usr/bin/env -S python3 -u
+"""Configure the WLAN of a Brother HL-1210W (and similar) over USB from Linux.
+
+Protocol reverse-engineered from Brother's Wireless Device Setup Wizard
+(uwdsw.exe): proprietary PJL objects set with
+    @PJL DEFAULT OBJBRNET="<id>:<value>"
+where string values are hex bytes joined with '-'.
+
+Usage:
+    brother-wlan                  scan with the printer, pick a network, enter the password
+    brother-wlan SSID             use this SSID (channel taken from the printer's scan)
+    brother-wlan --scan           only list the networks the printer sees
+Options:
+    --device /dev/usb/lp0         printer device
+    --password-from-nm            take the passphrase from the NetworkManager connection named like the SSID
+    --dry-run                     print what would be sent, send nothing (passphrase masked)
+
+The device must be writable, e.g.:
+    echo 'SUBSYSTEM=="usbmisc", KERNEL=="lp[0-9]*", ATTRS{idVendor}=="04f9", MODE="0666"' \
+      | sudo tee /etc/udev/rules.d/99-brother-lp.rules && sudo udevadm control --reload \
+      && sudo udevadm trigger --subsystem-match=usbmisc
+"""
+import argparse
+import getpass
+import os
+import subprocess
+import sys
+import time
+
+UEL = b"\x1b%-12345X"
+
+
+class Printer:
+    def __init__(self, device):
+        try:
+            self.fd = os.open(device, os.O_RDWR | os.O_NONBLOCK)
+        except OSError as e:
+            sys.exit(f"cannot open {device}: {e}")
+
+    def drain(self):
+        try:
+            while os.read(self.fd, 65536):
+                pass
+        except OSError:
+            pass
+
+    def read(self, max_wait=30.0, quiet=4.0):
+        out, start, last = b"", time.time(), None
+        while time.time() - start < max_wait:
+            time.sleep(0.4)
+            try:
+                chunk = os.read(self.fd, 65536)
+            except OSError:
+                chunk = b""
+            if chunk:
+                out += chunk
+                last = time.time()
+            elif last and time.time() - last > quiet:
+                break
+        return out.decode("latin1").replace("\r", "").replace("\xff", "")
+
+    def job(self, body, max_wait=30.0, quiet=4.0):
+        self.drain()
+        os.write(self.fd, UEL + b"@PJL\r\n" + body + UEL)
+        return self.read(max_wait, quiet)
+
+    def set_objects(self, lines):
+        body = b"".join(b'@PJL DEFAULT OBJBRNET="' + l.encode("latin1") + b'"\r\n' for l in lines)
+        return self.job(body + b"@PJL INQUIRE OBJBRNET\r\n", 30, 3)
+
+    def model(self):
+        return self.job(b"@PJL INFO ID\r\n", 10, 2).split("\n")[1:2]
+
+    def scan(self):
+        # 458845 = "1:" makes the printer scan; the wizard waits 20 s before reading the list
+        self.set_objects(["458845:" + enc("1:")])
+        time.sleep(20)
+        text = self.job(b"@PJL INFO AVAILABLEWLAN\r\n", 60, 6)
+        columns, networks = [], []
+        for line in text.split("\n"):
+            parts = line.split(",")
+            if parts[0] == "LAP":
+                columns = [p.rstrip(".*") for p in parts[1:]]
+            elif parts[0] == "VAP" and columns:
+                networks.append(dict(zip(columns, parts[1:])))
+        return networks
+
+
+def enc(s):
+    b = s.encode("utf-8")
+    if len(b) == 1:
+        return "0x%2x" % b[0]
+    return "%2x" % b[0] + "".join("-%2x" % c for c in b[1:])
+
+
+def pick(networks, ssid):
+    if ssid:
+        for n in networks:
+            if n.get("458848") == ssid:
+                return n
+        sys.exit(f"the printer does not see '{ssid}' (2.4 GHz only). Seen: "
+                 + ", ".join(n.get("458848", "?") for n in networks))
+    for i, n in enumerate(networks, 1):
+        print(f"{i:2}) {n.get('458848'):32} channel {n.get('458851')}  signal {n.get('458852')}")
+    while True:
+        choice = input("network number: ").strip()
+        if choice.isdigit() and 1 <= int(choice) <= len(networks):
+            return networks[int(choice) - 1]
+
+
+def passphrase(ssid, from_nm):
+    if from_nm:
+        psk = subprocess.run(
+            ["nmcli", "-s", "-g", "802-11-wireless-security.psk", "connection", "show", ssid],
+            capture_output=True, text=True).stdout.strip()
+        if psk:
+            return psk
+        print(f"no saved passphrase for '{ssid}' in NetworkManager")
+    while True:
+        psk = getpass.getpass(f"WPA passphrase for '{ssid}': ")
+        if 8 <= len(psk) <= 63:
+            return psk
+        print("a WPA passphrase has 8 to 63 characters")
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Configure a Brother printer's WLAN over USB")
+    ap.add_argument("ssid", nargs="?")
+    ap.add_argument("--device", default="/dev/usb/lp0")
+    ap.add_argument("--scan", action="store_true")
+    ap.add_argument("--password-from-nm", action="store_true")
+    ap.add_argument("--dry-run", action="store_true")
+    args = ap.parse_args()
+
+    printer = Printer(args.device)
+    print("printer:", *printer.model())
+    print("scanning with the printer (about 25 s) ...")
+    networks = printer.scan()
+    if not networks:
+        sys.exit("the printer found no networks; switch it off and on and try again")
+    if args.scan:
+        for n in networks:
+            print(f"{n.get('458848'):32} channel {n.get('458851')}  signal {n.get('458852')}")
+        return
+
+    net = pick(networks, args.ssid)
+    ssid = net["458848"]
+    psk = passphrase(ssid, args.password_from_nm)
+
+    lines = [
+        "458867:0",
+        "459138.2:1",
+        "459138.1:0",
+        "458876:" + net.get("458849", "5"),   # mode, from the scan
+        "458877:" + enc(ssid),                # SSID
+        "458878:" + net.get("458850", "1"),   # from the scan
+        "458879:" + net.get("458851", "1"),   # channel, from the scan
+        "459288:" + enc(psk),                 # WPA/WPA2 passphrase
+        "458970.2:0",                         # IP address automatically (DHCP)
+        "458865:5",                           # apply
+    ]
+    for l in lines:
+        shown = f"459288:<passphrase, {len(psk)} characters>" if l.startswith("459288:") else l
+        print(f'  @PJL DEFAULT OBJBRNET="{shown}"')
+    if args.dry_run:
+        print("dry run, nothing sent")
+        return
+
+    reply = printer.set_objects(lines)
+    print("printer replied:", reply.replace(enc(psk), "<passphrase>").strip())
+    print(f"sent. The printer now restarts its WLAN and joins '{ssid}' (allow a minute).")
+
+
+if __name__ == "__main__":
+    main()
